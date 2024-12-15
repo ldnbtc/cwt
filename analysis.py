@@ -8,11 +8,55 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from textblob import TextBlob
 from tqdm import tqdm
 
+def fetch_page(url, headers):
+    """
+    Fetch a single page with error handling
+    """
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        return response.text
+    except Exception as e:
+        print(f"Error fetching {url}: {str(e)}")
+        return None
+
+def extract_content_sections(entry):
+    """
+    Extracts different sections of the blog post content:
+    - Tyler's commentary (excluding blockquotes)
+    - Whether post ends with "Recommended"
+    """
+    content_div = entry.find('div', class_='entry-content')
+    if not content_div:
+        return "", False
+    
+    # Get all content elements
+    elements = content_div.contents
+    tyler_commentary = []
+    in_blockquote = False
+    
+    for element in elements:
+        if element.name == 'blockquote':
+            in_blockquote = True
+            continue
+        elif in_blockquote and element.name in ['p', 'div']:
+            in_blockquote = False
+        
+        if not in_blockquote and element.string:
+            tyler_commentary.append(element.string.strip())
+    
+    # Join Tyler's commentary
+    commentary = ' '.join(filter(None, tyler_commentary))
+    
+    # Check if post ends with "Recommended"
+    ends_with_recommended = bool(re.search(r'Recommended\s*$', content_div.get_text().strip()))
+    
+    return commentary, ends_with_recommended
+
 def extract_comment_count(entry):
     """
     Extract comment count from a blog post entry
     """
-    # First try to find a link containing "Comments"
     comment_text = None
     
     # Look for text ending in "Comments" or "Comment"
@@ -30,34 +74,14 @@ def extract_comment_count(entry):
         elif comment_text == "Comment":  # Single comment case
             return 1
     
-    # Backup method: look for comment links
-    comment_link = entry.find('a', href=re.compile(r'#comment'))
-    if comment_link:
-        comment_text = comment_link.get_text().strip()
-        count_match = re.search(r'(\d+)', comment_text)
-        if count_match:
-            return int(count_match.group(1))
-    
     return 0
-
-def fetch_page(url, headers):
-    """
-    Fetch a single page with error handling
-    """
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        return response.text
-    except Exception as e:
-        print(f"Error fetching {url}: {str(e)}")
-        return None
 
 def process_page(html, podcast_pattern, cutoff_date):
     """
     Process a single page of HTML and extract podcast posts
     """
     if not html:
-        return []
+        return [], False
     
     posts = []
     soup = BeautifulSoup(html, 'html.parser')
@@ -79,9 +103,9 @@ def process_page(html, podcast_pattern, cutoff_date):
         title = title_elem.text.strip()
         if not podcast_pattern.search(title):
             continue
-            
-        content = entry.find('div', class_='entry-content')
-        content_text = content.text.strip() if content else ''
+        
+        # Extract content sections
+        commentary, ends_with_recommended = extract_content_sections(entry)
         
         qualifier_match = re.search(r'my\s+(\w+)\s+conversation', title, re.IGNORECASE)
         qualifier = qualifier_match.group(1) if qualifier_match else None
@@ -92,10 +116,11 @@ def process_page(html, podcast_pattern, cutoff_date):
         posts.append({
             'date': post_date,
             'title': title,
-            'content': content_text,
+            'commentary': commentary,
             'url': entry.find('a')['href'] if entry.find('a') else '',
             'title_qualifier': qualifier,
-            'comment_count': comment_count
+            'comment_count': comment_count,
+            'ends_with_recommended': ends_with_recommended
         })
     
     return posts, False
@@ -144,7 +169,8 @@ def analyze_posts(posts):
     """
     if not posts:
         print("No posts to analyze.")
-        return pd.DataFrame(columns=['date', 'title', 'qualifiers', 'sentiment_score', 'url', 'title_qualifier', 'comment_count'])
+        return pd.DataFrame(columns=['date', 'title', 'qualifiers', 'sentiment_score', 'url', 
+                                   'title_qualifier', 'comment_count', 'ends_with_recommended'])
     
     results = []
     
@@ -153,28 +179,31 @@ def analyze_posts(posts):
         if post.get('title_qualifier'):
             qualifiers.append(post['title_qualifier'].lower())
         
+        # Look for qualifiers in title and Tyler's commentary
         if (re.search(r'excellent', post['title'], re.IGNORECASE) or 
-            re.search(r'excellent', post['content'], re.IGNORECASE)):
+            re.search(r'excellent', post['commentary'], re.IGNORECASE)):
             if 'excellent' not in qualifiers:
                 qualifiers.append('excellent')
         
         other_qualifiers = ['fascinating', 'wonderful', 'great', 'outstanding', 'remarkable', 'contentious']
         for qualifier in other_qualifiers:
             if (re.search(rf'\b{qualifier}\b', post['title'], re.IGNORECASE) or 
-                re.search(rf'\b{qualifier}\b', post['content'], re.IGNORECASE)):
+                re.search(rf'\b{qualifier}\b', post['commentary'], re.IGNORECASE)):
                 if qualifier not in qualifiers:
                     qualifiers.append(qualifier)
         
-        blob = TextBlob(post['content'])
+        # Sentiment analysis only on Tyler's commentary
+        sentiment_score = TextBlob(post['commentary']).sentiment.polarity if post['commentary'] else 0
         
         results.append({
             'date': post['date'],
             'title': post['title'],
             'qualifiers': qualifiers,
-            'sentiment_score': blob.sentiment.polarity,
+            'sentiment_score': sentiment_score,
             'url': post['url'],
             'title_qualifier': post.get('title_qualifier'),
-            'comment_count': post['comment_count']
+            'comment_count': post['comment_count'],
+            'ends_with_recommended': post['ends_with_recommended']
         })
     
     return pd.DataFrame(results)
@@ -194,6 +223,9 @@ def main():
         print("\nPosts by title qualifier:")
         title_qualifiers = df[df['title_qualifier'].notna()]['title_qualifier'].value_counts()
         print(title_qualifiers)
+        
+        recommended_count = df['ends_with_recommended'].sum()
+        print(f"\nPosts ending with 'Recommended': {recommended_count} ({(recommended_count/len(df)*100):.1f}%)")
         
         print("\nPosts with 'excellent' qualifier:")
         excellent_posts = df[df['qualifiers'].apply(lambda x: 'excellent' in x)]
